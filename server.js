@@ -71,7 +71,7 @@ app.use('/api/voice/webhook', express.raw({ type: 'application/x-www-form-urlenc
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+  res.json({ status: 'OK_SEPT_16_19H', timestamp: new Date().toISOString() });
 });
 
 // Twilio Voice webhook endpoint
