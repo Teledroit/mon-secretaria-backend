@@ -783,3 +783,8 @@ app.listen(port, () => {
   console.log(`Health check: http://localhost:${port}/health`);
   console.log(`Voice webhook URL: ${process.env.BACKEND_URL || process.env.VITE_BACKEND_URL}/api/voice/webhook`);
 });
+
+git add backend/server.js
+git commit -m "Add detailed logging for Google OAuth debugging"
+git push origin main
+
