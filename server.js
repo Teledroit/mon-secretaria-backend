@@ -18,6 +18,7 @@ const twilioClient = twilio(
 
 // Initialize TwiML for voice responses
 const { twiml } = twilio;
+
 // Initialize Supabase client
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -25,7 +26,7 @@ const supabase = createClient(
 );
 
 // Configure nodemailer
-const transporter = nodemailer.createTransporter({
+const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
     user: process.env.EMAIL_USER,
@@ -33,20 +34,42 @@ const transporter = nodemailer.createTransporter({
   }
 });
 
+// Vérification des variables d'environnement requises
+const requiredEnvVars = [
+  'TWILIO_ACCOUNT_SID',
+  'TWILIO_AUTH_TOKEN',
+  'TWILIO_PHONE_NUMBER',
+  'VITE_SUPABASE_URL',
+  'VITE_SUPABASE_ANON_KEY',
+  'EMAIL_USER',
+  'EMAIL_PASSWORD',
+  'GOOGLE_CLIENT_ID',
+  'GOOGLE_CLIENT_SECRET',
+  'FRONTEND_URL',
+  'BACKEND_URL',
+  'TRANSFER_NUMBER'
+];
+
+requiredEnvVars.forEach(varName => {
+  if (!process.env[varName]) {
+    console.warn(`Warning: ${varName} is not set in environment variables. Some features might not work.`);
+  }
+});
+
+// Configuration CORS
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true
 }));
 
 app.use(express.json());
-
-// Middleware for Twilio webhook signature validation (optional but recommended)
+app.use(express.urlencoded({ extended: true }));
 app.use('/api/voice/webhook', express.raw({ type: 'application/x-www-form-urlencoded' }));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
+  res.json({
+    status: 'OK',
     timestamp: new Date().toISOString(),
     services: {
       twilio: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
@@ -58,7 +81,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Enhanced webhook endpoint with better error handling
+// Stripe webhook endpoint
 app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     const sig = req.headers['stripe-signature'];
@@ -69,7 +92,6 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
       return res.status(500).send('Webhook secret not configured');
     }
 
-    // Forward to Supabase Edge Function for processing
     const response = await fetch(`${process.env.VITE_SUPABASE_URL}/functions/v1/stripe-webhook`, {
       method: 'POST',
       headers: {
@@ -90,147 +112,18 @@ app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async
   }
 });
 
-// Google OAuth token exchange endpoint
-app.post('/api/google-oauth-exchange', async (req, res) => {
-  console.log('=== GOOGLE OAUTH EXCHANGE REQUEST ===');
-  console.log('Timestamp:', new Date().toISOString());
-  console.log('Request method:', req.method);
-  console.log('Request headers:', JSON.stringify(req.headers, null, 2));
-  console.log('Request body:', JSON.stringify(req.body, null, 2));
-  
-  try {
-    console.log('Google OAuth exchange request received:', {
-      hasCode: !!req.body.code,
-      redirectUri: req.body.redirect_uri,
-      timestamp: new Date().toISOString()
-    });
-    
-    const { code, redirect_uri } = req.body;
-
-    if (!code || !redirect_uri) {
-      console.error('Missing required fields:', { code: !!code, redirect_uri: !!redirect_uri });
-      return res.status(400).json({ 
-        error: 'Missing required fields: code, redirect_uri' 
-      });
-    }
-
-    const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-    const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-    const FRONTEND_URL = process.env.FRONTEND_URL;
-    
-    console.log('Environment variables check:', {
-      hasClientId: !!CLIENT_ID,
-      hasClientSecret: !!CLIENT_SECRET,
-      frontendUrl: FRONTEND_URL,
-      clientIdPrefix: CLIENT_ID ? CLIENT_ID.substring(0, 20) + '...' : 'MISSING',
-      clientSecretPrefix: CLIENT_SECRET ? CLIENT_SECRET.substring(0, 10) + '...' : 'MISSING'
-    });
-
-    if (!CLIENT_ID || !CLIENT_SECRET) {
-      console.error('Google OAuth credentials missing:', { 
-        hasClientId: !!CLIENT_ID, 
-        hasClientSecret: !!CLIENT_SECRET,
-        frontendUrl: FRONTEND_URL
-      });
-      return res.status(500).json({ 
-        error: 'Google OAuth credentials not configured on server' 
-      });
-    }
-    
-    // Validate redirect_uri matches expected frontend URL
-    const expectedRedirectUri = `${FRONTEND_URL}/calendar/callback`;
-    console.log('Redirect URI validation:', {
-      received: redirect_uri,
-      expected: expectedRedirectUri,
-      matches: redirect_uri === expectedRedirectUri
-    });
-    
-    if (redirect_uri !== expectedRedirectUri) {
-      console.error('Redirect URI mismatch:', {
-        received: redirect_uri,
-        expected: expectedRedirectUri
-      });
-    }
-
-    console.log('Exchanging code for tokens with Google...', {
-      clientId: CLIENT_ID.substring(0, 10) + '...',
-      redirectUri: redirect_uri
-    });
-    
-    // Exchange authorization code for access token
-    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({
-        code,
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        redirect_uri: redirect_uri,
-        grant_type: 'authorization_code'
-      })
-    });
-    
-    console.log('Google token response status:', {
-      status: tokenResponse.status,
-      statusText: tokenResponse.statusText,
-      ok: tokenResponse.ok
-    });
-
-    if (!tokenResponse.ok) {
-      const errorData = await tokenResponse.json().catch(() => ({}));
-      console.error('Google token exchange error:', {
-        status: tokenResponse.status,
-        statusText: tokenResponse.statusText,
-        errorData
-      });
-      return res.status(tokenResponse.status).json({
-        error: errorData.error_description || errorData.error || 'Token exchange failed'
-      });
-    }
-
-    const tokens = await tokenResponse.json();
-    console.log('Tokens received successfully from Google:', {
-      hasAccessToken: !!tokens.access_token,
-      hasRefreshToken: !!tokens.refresh_token,
-      tokenType: tokens.token_type,
-      expiresIn: tokens.expires_in
-    });
-    
-    // Return tokens to frontend
-    res.json(tokens);
-
-  } catch (error) {
-    console.error('=== GOOGLE OAUTH EXCHANGE ERROR ===');
-    console.error('Error details:', {
-      message: error.message,
-      stack: error.stack,
-      name: error.name
-    });
-    
-    res.status(500).json({ 
-      error: 'Internal server error during OAuth exchange',
-      details: error.message 
-    });
-  }
-});
-
 // Twilio Voice webhook endpoint
 app.post('/api/voice/webhook', async (req, res) => {
   try {
     console.log('Incoming Twilio voice webhook:', req.body);
-    
+
     const response = new twiml.VoiceResponse();
-    
-    // Get the caller's phone number
     const from = req.body.From;
     const to = req.body.To;
     const callSid = req.body.CallSid;
-    
+
     console.log(`Incoming call from ${from} to ${to}, CallSid: ${callSid}`);
-    
-    // Log the call in the database
+
     try {
       const { data: callData, error: callError } = await supabase
         .from('calls')
@@ -238,11 +131,11 @@ app.post('/api/voice/webhook', async (req, res) => {
           start_time: new Date().toISOString(),
           phone_number: from,
           status: 'in-progress',
-          client_name: null // Will be updated later if identified
+          client_name: null
         })
         .select()
         .single();
-        
+
       if (callError) {
         console.error('Error logging call:', callError);
       } else {
@@ -251,14 +144,12 @@ app.post('/api/voice/webhook', async (req, res) => {
     } catch (dbError) {
       console.error('Database error:', dbError);
     }
-    
-    // Create the AI assistant response
+
     response.say({
       voice: 'alice',
       language: 'fr-FR'
     }, "Bonjour, vous êtes en communication avec l'assistant virtuel du cabinet MonSecretarIA. Comment puis-je vous aider ?");
-    
-    // Gather user input
+
     const gather = response.gather({
       input: 'speech',
       language: 'fr-FR',
@@ -266,34 +157,32 @@ app.post('/api/voice/webhook', async (req, res) => {
       action: '/api/voice/process-speech',
       method: 'POST'
     });
-    
+
     gather.say({
       voice: 'alice',
       language: 'fr-FR'
     }, "Je vous écoute...");
-    
-    // Fallback if no input is detected
+
     response.say({
       voice: 'alice',
       language: 'fr-FR'
     }, "Je n'ai pas bien entendu. Au revoir.");
-    
+
     response.hangup();
-    
+
     res.type('text/xml');
     res.send(response.toString());
-    
+
   } catch (error) {
     console.error('Error in voice webhook:', error);
-    
-    // Send a simple error response
+
     const errorResponse = new twiml.VoiceResponse();
     errorResponse.say({
       voice: 'alice',
       language: 'fr-FR'
     }, "Désolé, une erreur technique est survenue. Veuillez rappeler plus tard.");
     errorResponse.hangup();
-    
+
     res.type('text/xml');
     res.send(errorResponse.toString());
   }
@@ -303,22 +192,21 @@ app.post('/api/voice/webhook', async (req, res) => {
 app.post('/api/voice/process-speech', async (req, res) => {
   try {
     console.log('Processing speech input:', req.body);
-    
+
     const speechResult = req.body.SpeechResult;
     const callSid = req.body.CallSid;
     const from = req.body.From;
-    
+
     console.log(`Speech from ${from}: "${speechResult}"`);
-    
+
     const response = new twiml.VoiceResponse();
-    
+
     if (!speechResult) {
       response.say({
         voice: 'alice',
         language: 'fr-FR'
       }, "Je n'ai pas bien compris. Pouvez-vous répéter ?");
-      
-      // Gather again
+
       const gather = response.gather({
         input: 'speech',
         language: 'fr-FR',
@@ -326,43 +214,40 @@ app.post('/api/voice/process-speech', async (req, res) => {
         action: '/api/voice/process-speech',
         method: 'POST'
       });
-      
+
       gather.say({
         voice: 'alice',
         language: 'fr-FR'
       }, "Je vous écoute...");
-      
+
       response.hangup();
       res.type('text/xml');
       res.send(response.toString());
       return;
     }
-    
-    // Simple keyword detection for demo purposes
+
     const lowerSpeech = speechResult.toLowerCase();
-    
+
     if (lowerSpeech.includes('rendez-vous') || lowerSpeech.includes('rdv') || lowerSpeech.includes('appointment')) {
       response.say({
         voice: 'alice',
         language: 'fr-FR'
       }, "Je peux vous aider à prendre un rendez-vous. Quel type de consultation souhaitez-vous ?");
-      
-      // Continue conversation
-      const gather = response.gather({
+
+      response.gather({
         input: 'speech',
         language: 'fr-FR',
         speechTimeout: 'auto',
         action: '/api/voice/handle-appointment',
         method: 'POST'
       });
-      
+
     } else if (lowerSpeech.includes('urgent') || lowerSpeech.includes('urgence')) {
       response.say({
         voice: 'alice',
         language: 'fr-FR'
       }, "Je comprends que c'est urgent. Je vais vous transférer immédiatement vers un avocat disponible.");
-      
-      // Transfer to configured number if available
+
       const transferNumber = process.env.TRANSFER_NUMBER;
       if (transferNumber) {
         response.dial(transferNumber);
@@ -376,14 +261,14 @@ app.post('/api/voice/process-speech', async (req, res) => {
           action: '/api/voice/handle-message'
         });
       }
-      
+
     } else {
       response.say({
         voice: 'alice',
         language: 'fr-FR'
       }, "Je peux vous aider avec la prise de rendez-vous ou vous transférer vers un avocat. Que préférez-vous ?");
-      
-      const gather = response.gather({
+
+      response.gather({
         input: 'speech',
         language: 'fr-FR',
         speechTimeout: 'auto',
@@ -391,20 +276,20 @@ app.post('/api/voice/process-speech', async (req, res) => {
         method: 'POST'
       });
     }
-    
+
     res.type('text/xml');
     res.send(response.toString());
-    
+
   } catch (error) {
     console.error('Error processing speech:', error);
-    
+
     const errorResponse = new twiml.VoiceResponse();
     errorResponse.say({
       voice: 'alice',
       language: 'fr-FR'
     }, "Une erreur est survenue. Au revoir.");
     errorResponse.hangup();
-    
+
     res.type('text/xml');
     res.send(errorResponse.toString());
   }
@@ -413,45 +298,39 @@ app.post('/api/voice/process-speech', async (req, res) => {
 // Handle appointment booking
 app.post('/api/voice/handle-appointment', async (req, res) => {
   try {
-    const speechResult = req.body.SpeechResult;
     const from = req.body.From;
-    
     const response = new twiml.VoiceResponse();
-    
+
     response.say({
       voice: 'alice',
       language: 'fr-FR'
     }, "Parfait. Pour prendre rendez-vous, je vais vous envoyer un SMS avec le lien de réservation. Merci de votre appel.");
-    
-    // Send SMS with Calendly link (if configured)
+
     try {
-      const message = "Bonjour, voici le lien pour prendre rendez-vous avec notre cabinet : https://calendly.com/votre-cabinet. Merci !";
-      
       await twilioClient.messages.create({
-        body: message,
+        body: "Bonjour, voici le lien pour prendre rendez-vous avec notre cabinet : https://calendly.com/votre-cabinet. Merci !",
         from: process.env.TWILIO_PHONE_NUMBER,
         to: from
       });
-      
       console.log(`SMS sent to ${from} with appointment link`);
     } catch (smsError) {
       console.error('Error sending SMS:', smsError);
     }
-    
+
     response.hangup();
     res.type('text/xml');
     res.send(response.toString());
-    
+
   } catch (error) {
     console.error('Error handling appointment:', error);
-    
+
     const errorResponse = new twiml.VoiceResponse();
     errorResponse.say({
       voice: 'alice',
       language: 'fr-FR'
     }, "Une erreur est survenue. Au revoir.");
     errorResponse.hangup();
-    
+
     res.type('text/xml');
     res.send(errorResponse.toString());
   }
@@ -462,27 +341,25 @@ app.post('/api/voice/handle-message', async (req, res) => {
   try {
     const recordingUrl = req.body.RecordingUrl;
     const from = req.body.From;
-    
+
     console.log(`Voice message received from ${from}: ${recordingUrl}`);
-    
-    // Here you could process the recording, transcribe it, etc.
-    
+
     const response = new twiml.VoiceResponse();
     response.say({
       voice: 'alice',
       language: 'fr-FR'
     }, "Votre message a été enregistré. Un avocat vous rappellera dans les plus brefs délais. Au revoir.");
     response.hangup();
-    
+
     res.type('text/xml');
     res.send(response.toString());
-    
+
   } catch (error) {
     console.error('Error handling voice message:', error);
-    
+
     const errorResponse = new twiml.VoiceResponse();
     errorResponse.hangup();
-    
+
     res.type('text/xml');
     res.send(errorResponse.toString());
   }
@@ -515,22 +392,19 @@ app.post('/api/contact', async (req, res) => {
   }
 });
 
-// Enhanced SMS sending endpoint with better validation
+// SMS sending endpoint
 app.post('/api/send-sms', async (req, res) => {
   try {
     const { to, message, userId, priority = 'normal' } = req.body;
 
     if (!to || !message) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: to, message' 
-      });
+      return res.status(400).json({ error: 'Missing required fields: to, message' });
     }
 
-    // Validate phone number format (basic validation)
     const phoneRegex = /^\+[1-9]\d{1,14}$/;
     if (!phoneRegex.test(to)) {
-      return res.status(400).json({ 
-        error: 'Invalid phone number format. Use international format (+33123456789)' 
+      return res.status(400).json({
+        error: 'Invalid phone number format. Use international format (+33123456789)'
       });
     }
 
@@ -540,14 +414,12 @@ app.post('/api/send-sms', async (req, res) => {
       to: to
     };
 
-    // Add priority handling for urgent messages
     if (priority === 'urgent') {
       messageOptions.statusCallback = `${process.env.BACKEND_URL}/api/sms-status`;
     }
 
     const smsResult = await twilioClient.messages.create(messageOptions);
 
-    // Log SMS in database if userId is provided
     if (userId) {
       await supabase
         .from('sms_logs')
@@ -557,22 +429,20 @@ app.post('/api/send-sms', async (req, res) => {
           message: message,
           twilio_sid: smsResult.sid,
           status: smsResult.status,
+          notification_type: 'manual_sms',
           sent_at: new Date().toISOString()
         });
     }
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       messageSid: smsResult.sid,
-      status: smsResult.status 
+      status: smsResult.status
     });
 
   } catch (error) {
     console.error('Error sending SMS:', error);
-    res.status(500).json({ 
-      error: 'Failed to send SMS',
-      details: error.message 
-    });
+    res.status(500).json({ error: 'Failed to send SMS', details: error.message });
   }
 });
 
@@ -580,14 +450,12 @@ app.post('/api/send-sms', async (req, res) => {
 app.post('/api/sms-status', async (req, res) => {
   try {
     const { MessageSid, MessageStatus, ErrorCode } = req.body;
-    
     console.log(`SMS ${MessageSid} status: ${MessageStatus}`);
-    
+
     if (ErrorCode) {
       console.error(`SMS error ${ErrorCode} for message ${MessageSid}`);
     }
 
-    // Update SMS log status in database
     await supabase
       .from('sms_logs')
       .update({ status: MessageStatus })
@@ -606,12 +474,9 @@ app.post('/api/trigger-notification', async (req, res) => {
     const { userId, type, data } = req.body;
 
     if (!userId || !type) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: userId, type' 
-      });
+      return res.status(400).json({ error: 'Missing required fields: userId, type' });
     }
 
-    // Get user and their notification preferences
     const { data: user, error: userError } = await supabase
       .from('users')
       .select('phone, email')
@@ -636,14 +501,17 @@ app.post('/api/trigger-notification', async (req, res) => {
     let message = '';
     let shouldSendSMS = false;
     let shouldSendEmail = false;
+    let emailAddress = user.email;
 
-    // Determine notification content and preferences based on type
     switch (type) {
       case 'appointment_booked':
         if (notifications.appointments?.enabled) {
           message = `Nouveau rendez-vous confirmé: ${data.clientName} le ${data.date} à ${data.time}`;
           shouldSendSMS = notifications.appointments.sms && user.phone;
           shouldSendEmail = notifications.appointments.email && user.email;
+          if (notifications.appointments.emailAddress) {
+            emailAddress = notifications.appointments.emailAddress;
+          }
         }
         break;
 
@@ -652,23 +520,23 @@ app.post('/api/trigger-notification', async (req, res) => {
           message = `URGENT: Appel nécessitant votre attention immédiate de ${data.clientName || 'un client'} (${data.phoneNumber})`;
           shouldSendSMS = notifications.urgentCalls.sms && user.phone;
           shouldSendEmail = notifications.urgentCalls.email && user.email;
+          if (notifications.urgentCalls.emailAddress) {
+            emailAddress = notifications.urgentCalls.emailAddress;
+          }
         }
         break;
-      let emailAddress = user.email; // Default to user's account email
 
       case 'important_request':
         if (notifications.importantRequests?.enabled) {
           const threshold = notifications.importantRequests.threshold || 'high';
-          if (data.importance >= threshold) {
+          const importanceLevels = { 'low': 0, 'medium': 1, 'high': 2 };
+          if (importanceLevels[data.importance] >= importanceLevels[threshold]) {
             message = `Demande importante: ${data.subject} de ${data.clientName || 'un client'}`;
-            shouldSendSMS = false; // Important requests only via email
+            shouldSendSMS = false;
             shouldSendEmail = notifications.importantRequests.email && user.email;
-            // Use custom email address if provided
-            if (notifications.appointments.emailAddress) {
+            if (notifications.importantRequests.emailAddress) {
+              emailAddress = notifications.importantRequests.emailAddress;
             }
-          }
-          if (notifications.importantRequests.emailAddress) {
-            emailAddress = notifications.importantRequests.emailAddress;
           }
         }
         break;
@@ -677,12 +545,8 @@ app.post('/api/trigger-notification', async (req, res) => {
         return res.status(400).json({ error: 'Invalid notification type' });
     }
 
-    const results = {
-      sms: null,
-      email: null
-    };
+    const results = { sms: null, email: null };
 
-    // Send SMS if enabled and phone number available
     if (shouldSendSMS && user.phone) {
       try {
         const smsResult = await twilioClient.messages.create({
@@ -691,13 +555,8 @@ app.post('/api/trigger-notification', async (req, res) => {
           to: user.phone
         });
 
-        results.sms = {
-          success: true,
-          messageSid: smsResult.sid,
-          status: smsResult.status
-        };
+        results.sms = { success: true, messageSid: smsResult.sid, status: smsResult.status };
 
-        // Log SMS
         await supabase
           .from('sms_logs')
           .insert({
@@ -712,23 +571,19 @@ app.post('/api/trigger-notification', async (req, res) => {
 
       } catch (smsError) {
         console.error('SMS sending failed:', smsError);
-        results.sms = {
-          success: false,
-          error: smsError.message
-        };
+        results.sms = { success: false, error: smsError.message };
       }
     }
 
-    // Send email if enabled and email available
-    if (shouldSendEmail && user.email) {
+    if (shouldSendEmail && emailAddress) {
       try {
-        const emailSubject = type === 'urgent_call' 
-          ? '🚨 URGENT - MonSecretarIA' 
-          : '📞 Notification - MonSecretarIA';
+        const emailSubject = type === 'urgent_call'
+          ? 'URGENT - MonSecretarIA'
+          : 'Notification - MonSecretarIA';
 
         const mailOptions = {
           from: process.env.EMAIL_USER,
-          to: user.email,
+          to: emailAddress,
           subject: emailSubject,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -748,32 +603,19 @@ app.post('/api/trigger-notification', async (req, res) => {
 
       } catch (emailError) {
         console.error('Email sending failed:', emailError);
-        results.email = {
-          success: false,
-          error: emailError.message
-        };
+        results.email = { success: false, error: emailError.message };
       }
     }
 
-    res.json({
-      success: true,
-      type,
-      message,
-      results,
-      sentSMS: shouldSendSMS,
-      sentEmail: shouldSendEmail
-    });
+    res.json({ success: true, type, message, results, sentSMS: shouldSendSMS, sentEmail: shouldSendEmail });
 
   } catch (error) {
     console.error('Error triggering notification:', error);
-    res.status(500).json({ 
-      error: 'Failed to trigger notification',
-      details: error.message 
-    });
+    res.status(500).json({ error: 'Failed to trigger notification', details: error.message });
   }
 });
 
-// Enhanced phone number search with better error handling
+// Phone number search endpoint
 app.post('/api/phone-numbers/search', async (req, res) => {
   try {
     const { areaCode, country = 'FR' } = req.body;
@@ -790,7 +632,7 @@ app.post('/api/phone-numbers/search', async (req, res) => {
       number: number.phoneNumber,
       location: number.locality || 'France',
       type: 'local',
-      price: 1, // €1/month for French numbers
+      price: 1,
       capabilities: number.capabilities
     }));
 
@@ -802,7 +644,7 @@ app.post('/api/phone-numbers/search', async (req, res) => {
   }
 });
 
-// Enhanced phone number purchase with webhook configuration
+// Phone number purchase endpoint
 app.post('/api/phone-numbers/purchase', async (req, res) => {
   try {
     const { phoneNumber } = req.body;
@@ -812,7 +654,6 @@ app.post('/api/phone-numbers/purchase', async (req, res) => {
       return res.status(401).json({ error: 'Authorization header required' });
     }
 
-    // Get user from auth token
     const token = authHeader.replace('Bearer ', '');
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
 
@@ -820,9 +661,8 @@ app.post('/api/phone-numbers/purchase', async (req, res) => {
       return res.status(401).json({ error: 'Invalid authentication' });
     }
 
-    // Purchase number via Twilio
     const webhookEndpoint = `${process.env.VITE_SUPABASE_URL}/functions/v1/twilio-webhook`;
-    
+
     const purchasedNumber = await twilioClient.incomingPhoneNumbers.create({
       phoneNumber: phoneNumber,
       voiceUrl: webhookEndpoint,
@@ -831,12 +671,11 @@ app.post('/api/phone-numbers/purchase', async (req, res) => {
       statusCallbackMethod: 'POST'
     });
 
-    // Get or create Twilio account for user
     let { data: twilioAccount } = await supabase
       .from('twilio_accounts')
       .select('id')
       .eq('user_id', user.id)
-      .single();
+      .maybeSingle();
 
     if (!twilioAccount) {
       const { data: newAccount, error: accountError } = await supabase
@@ -854,7 +693,6 @@ app.post('/api/phone-numbers/purchase', async (req, res) => {
       twilioAccount = newAccount;
     }
 
-    // Save to database
     const { error: phoneError } = await supabase
       .from('twilio_phone_numbers')
       .insert({
@@ -866,8 +704,8 @@ app.post('/api/phone-numbers/purchase', async (req, res) => {
 
     if (phoneError) throw phoneError;
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       phoneNumber: purchasedNumber.phoneNumber,
       sid: purchasedNumber.sid,
       webhookUrl: webhookEndpoint
@@ -883,12 +721,10 @@ app.post('/api/phone-numbers/purchase', async (req, res) => {
 app.post('/api/call-status', async (req, res) => {
   try {
     const { CallSid, CallStatus, CallDuration } = req.body;
-    
     console.log(`Call ${CallSid} status: ${CallStatus}`);
-    
-    // Update call status in database
+
     const updateData = { status: CallStatus };
-    
+
     if (CallStatus === 'completed' && CallDuration) {
       updateData.end_time = new Date().toISOString();
       updateData.duration = `00:${Math.floor(CallDuration / 60)}:${CallDuration % 60}`;
@@ -906,17 +742,75 @@ app.post('/api/call-status', async (req, res) => {
   }
 });
 
+// Google OAuth token exchange endpoint
+app.post('/api/google-oauth-exchange', async (req, res) => {
+  try {
+    console.log('Google OAuth exchange request received:', {
+      hasCode: !!req.body.code,
+      redirectUri: req.body.redirect_uri,
+      timestamp: new Date().toISOString()
+    });
+
+    const { code, redirect_uri } = req.body;
+
+    if (!code || !redirect_uri) {
+      return res.status(400).json({ error: 'Missing required fields: code, redirect_uri' });
+    }
+
+    const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+    const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+    const FRONTEND_URL = process.env.FRONTEND_URL;
+
+    if (!CLIENT_ID || !CLIENT_SECRET) {
+      console.error('Google OAuth credentials missing');
+      return res.status(500).json({ error: 'Google OAuth credentials not configured on server' });
+    }
+
+    const expectedRedirectUri = `${FRONTEND_URL}/calendar/callback`;
+    if (redirect_uri !== expectedRedirectUri) {
+      console.warn('Redirect URI mismatch:', { received: redirect_uri, expected: expectedRedirectUri });
+    }
+
+    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        redirect_uri: redirect_uri,
+        grant_type: 'authorization_code'
+      })
+    });
+
+    if (!tokenResponse.ok) {
+      const errorData = await tokenResponse.json().catch(() => ({}));
+      console.error('Google token exchange error:', errorData);
+      return res.status(tokenResponse.status).json({
+        error: errorData.error_description || errorData.error || 'Token exchange failed'
+      });
+    }
+
+    const tokens = await tokenResponse.json();
+    console.log('Tokens received successfully from Google');
+    res.json(tokens);
+
+  } catch (error) {
+    console.error('Error in Google OAuth exchange:', error);
+    res.status(500).json({ error: 'Internal server error during OAuth exchange', details: error.message });
+  }
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
-  console.log(`Environment check:`, {
-    port,
-    hasGoogleClientId: !!process.env.GOOGLE_CLIENT_ID,
-    hasGoogleClientSecret: !!process.env.GOOGLE_CLIENT_SECRET,
-    frontendUrl: process.env.FRONTEND_URL,
-    backendUrl: process.env.BACKEND_URL || process.env.VITE_BACKEND_URL
-  });
   console.log(`Health check: http://localhost:${port}/health`);
   console.log(`Voice webhook URL: ${process.env.VITE_SUPABASE_URL}/functions/v1/twilio-webhook`);
-  console.log(`Google OAuth endpoint: ${process.env.BACKEND_URL || process.env.VITE_BACKEND_URL}/api/google-oauth-exchange`);
-  console.log(`Stripe webhook endpoint: ${process.env.BACKEND_URL || process.env.VITE_BACKEND_URL}/api/webhook/stripe`);
+  console.log(`Google OAuth endpoint: ${process.env.BACKEND_URL}/api/google-oauth-exchange`);
+  console.log(`Stripe webhook endpoint: ${process.env.BACKEND_URL}/api/webhook/stripe`);
 });
