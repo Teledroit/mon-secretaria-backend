@@ -18,7 +18,6 @@ const twilioClient = twilio(
 
 // Initialize TwiML for voice responses
 const { twiml } = twilio;
-
 // Initialize Supabase client
 const supabase = createClient(
   process.env.VITE_SUPABASE_URL,
@@ -26,7 +25,7 @@ const supabase = createClient(
 );
 
 // Configure nodemailer
-const transporter = nodemailer.createTransport({
+const transporter = nodemailer.createTransporter({
   service: 'gmail',
   auth: {
     user: process.env.EMAIL_USER,
@@ -34,44 +33,187 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// Vérification des variables d'environnement requises
-const requiredEnvVars = [
-  'TWILIO_ACCOUNT_SID',
-  'TWILIO_AUTH_TOKEN',
-  'TWILIO_PHONE_NUMBER',
-  'OPENAI_API_KEY', // Utilisé par les Edge Functions Supabase, mais listé ici pour la complétude
-  'VITE_SUPABASE_URL',
-  'VITE_SUPABASE_ANON_KEY',
-  'EMAIL_USER',
-  'EMAIL_PASSWORD',
-  'GOOGLE_CLIENT_ID',
-  'GOOGLE_CLIENT_SECRET',
-  'FRONTEND_URL',
-  'BACKEND_URL',
-  'TRANSFER_NUMBER'
-];
-
-requiredEnvVars.forEach(varName => {
-  if (!process.env[varName]) {
-    console.warn(`Warning: ${varName} is not set in environment variables. Some features might not work.`);
-  }
-});
-
-// Configuration CORS
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true
 }));
 
-// Middleware pour parser les requêtes
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-// Middleware spécifique pour les webhooks Twilio qui envoient du x-www-form-urlencoded
+
+// Middleware for Twilio webhook signature validation (optional but recommended)
 app.use('/api/voice/webhook', express.raw({ type: 'application/x-www-form-urlencoded' }));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK_SEPT_16_19H', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    services: {
+      twilio: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
+      supabase: !!process.env.VITE_SUPABASE_URL,
+      openai: !!process.env.OPENAI_API_KEY,
+      google: !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
+      elevenlabs: !!process.env.VITE_ELEVENLABS_API_KEY
+    }
+  });
+});
+
+// Enhanced webhook endpoint with better error handling
+app.post('/api/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const sig = req.headers['stripe-signature'];
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!endpointSecret) {
+      console.error('Stripe webhook secret not configured');
+      return res.status(500).send('Webhook secret not configured');
+    }
+
+    // Forward to Supabase Edge Function for processing
+    const response = await fetch(`${process.env.VITE_SUPABASE_URL}/functions/v1/stripe-webhook`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'stripe-signature': sig,
+      },
+      body: req.body
+    });
+
+    if (!response.ok) {
+      throw new Error(`Webhook processing failed: ${response.statusText}`);
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    console.error('Stripe webhook error:', error);
+    res.status(400).send(`Webhook Error: ${error.message}`);
+  }
+});
+
+// Google OAuth token exchange endpoint
+app.post('/api/google-oauth-exchange', async (req, res) => {
+  console.log('=== GOOGLE OAUTH EXCHANGE REQUEST ===');
+  console.log('Timestamp:', new Date().toISOString());
+  console.log('Request method:', req.method);
+  console.log('Request headers:', JSON.stringify(req.headers, null, 2));
+  console.log('Request body:', JSON.stringify(req.body, null, 2));
+  
+  try {
+    console.log('Google OAuth exchange request received:', {
+      hasCode: !!req.body.code,
+      redirectUri: req.body.redirect_uri,
+      timestamp: new Date().toISOString()
+    });
+    
+    const { code, redirect_uri } = req.body;
+
+    if (!code || !redirect_uri) {
+      console.error('Missing required fields:', { code: !!code, redirect_uri: !!redirect_uri });
+      return res.status(400).json({ 
+        error: 'Missing required fields: code, redirect_uri' 
+      });
+    }
+
+    const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+    const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+    const FRONTEND_URL = process.env.FRONTEND_URL;
+    
+    console.log('Environment variables check:', {
+      hasClientId: !!CLIENT_ID,
+      hasClientSecret: !!CLIENT_SECRET,
+      frontendUrl: FRONTEND_URL,
+      clientIdPrefix: CLIENT_ID ? CLIENT_ID.substring(0, 20) + '...' : 'MISSING',
+      clientSecretPrefix: CLIENT_SECRET ? CLIENT_SECRET.substring(0, 10) + '...' : 'MISSING'
+    });
+
+    if (!CLIENT_ID || !CLIENT_SECRET) {
+      console.error('Google OAuth credentials missing:', { 
+        hasClientId: !!CLIENT_ID, 
+        hasClientSecret: !!CLIENT_SECRET,
+        frontendUrl: FRONTEND_URL
+      });
+      return res.status(500).json({ 
+        error: 'Google OAuth credentials not configured on server' 
+      });
+    }
+    
+    // Validate redirect_uri matches expected frontend URL
+    const expectedRedirectUri = `${FRONTEND_URL}/calendar/callback`;
+    console.log('Redirect URI validation:', {
+      received: redirect_uri,
+      expected: expectedRedirectUri,
+      matches: redirect_uri === expectedRedirectUri
+    });
+    
+    if (redirect_uri !== expectedRedirectUri) {
+      console.error('Redirect URI mismatch:', {
+        received: redirect_uri,
+        expected: expectedRedirectUri
+      });
+    }
+
+    console.log('Exchanging code for tokens with Google...', {
+      clientId: CLIENT_ID.substring(0, 10) + '...',
+      redirectUri: redirect_uri
+    });
+    
+    // Exchange authorization code for access token
+    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        code,
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        redirect_uri: redirect_uri,
+        grant_type: 'authorization_code'
+      })
+    });
+    
+    console.log('Google token response status:', {
+      status: tokenResponse.status,
+      statusText: tokenResponse.statusText,
+      ok: tokenResponse.ok
+    });
+
+    if (!tokenResponse.ok) {
+      const errorData = await tokenResponse.json().catch(() => ({}));
+      console.error('Google token exchange error:', {
+        status: tokenResponse.status,
+        statusText: tokenResponse.statusText,
+        errorData
+      });
+      return res.status(tokenResponse.status).json({
+        error: errorData.error_description || errorData.error || 'Token exchange failed'
+      });
+    }
+
+    const tokens = await tokenResponse.json();
+    console.log('Tokens received successfully from Google:', {
+      hasAccessToken: !!tokens.access_token,
+      hasRefreshToken: !!tokens.refresh_token,
+      tokenType: tokens.token_type,
+      expiresIn: tokens.expires_in
+    });
+    
+    // Return tokens to frontend
+    res.json(tokens);
+
+  } catch (error) {
+    console.error('=== GOOGLE OAUTH EXCHANGE ERROR ===');
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack,
+      name: error.name
+    });
+    
+    res.status(500).json({ 
+      error: 'Internal server error during OAuth exchange',
+      details: error.message 
+    });
+  }
 });
 
 // Twilio Voice webhook endpoint
@@ -373,10 +515,10 @@ app.post('/api/contact', async (req, res) => {
   }
 });
 
-// SMS sending endpoint
+// Enhanced SMS sending endpoint with better validation
 app.post('/api/send-sms', async (req, res) => {
   try {
-    const { to, message, userId } = req.body;
+    const { to, message, userId, priority = 'normal' } = req.body;
 
     if (!to || !message) {
       return res.status(400).json({ 
@@ -392,12 +534,18 @@ app.post('/api/send-sms', async (req, res) => {
       });
     }
 
-    // Send SMS via Twilio
-    const smsResult = await twilioClient.messages.create({
+    const messageOptions = {
       body: message,
       from: process.env.TWILIO_PHONE_NUMBER,
       to: to
-    });
+    };
+
+    // Add priority handling for urgent messages
+    if (priority === 'urgent') {
+      messageOptions.statusCallback = `${process.env.BACKEND_URL}/api/sms-status`;
+    }
+
+    const smsResult = await twilioClient.messages.create(messageOptions);
 
     // Log SMS in database if userId is provided
     if (userId) {
@@ -409,7 +557,6 @@ app.post('/api/send-sms', async (req, res) => {
           message: message,
           twilio_sid: smsResult.sid,
           status: smsResult.status,
-          notification_type: 'manual_sms', // Added a type for manual SMS
           sent_at: new Date().toISOString()
         });
     }
@@ -426,6 +573,30 @@ app.post('/api/send-sms', async (req, res) => {
       error: 'Failed to send SMS',
       details: error.message 
     });
+  }
+});
+
+// SMS status callback endpoint
+app.post('/api/sms-status', async (req, res) => {
+  try {
+    const { MessageSid, MessageStatus, ErrorCode } = req.body;
+    
+    console.log(`SMS ${MessageSid} status: ${MessageStatus}`);
+    
+    if (ErrorCode) {
+      console.error(`SMS error ${ErrorCode} for message ${MessageSid}`);
+    }
+
+    // Update SMS log status in database
+    await supabase
+      .from('sms_logs')
+      .update({ status: MessageStatus })
+      .eq('twilio_sid', MessageSid);
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error handling SMS status:', error);
+    res.status(500).json({ error: 'Failed to process SMS status' });
   }
 });
 
@@ -465,7 +636,6 @@ app.post('/api/trigger-notification', async (req, res) => {
     let message = '';
     let shouldSendSMS = false;
     let shouldSendEmail = false;
-    let emailAddress = user.email; // Default to user's account email
 
     // Determine notification content and preferences based on type
     switch (type) {
@@ -474,9 +644,6 @@ app.post('/api/trigger-notification', async (req, res) => {
           message = `Nouveau rendez-vous confirmé: ${data.clientName} le ${data.date} à ${data.time}`;
           shouldSendSMS = notifications.appointments.sms && user.phone;
           shouldSendEmail = notifications.appointments.email && user.email;
-          if (notifications.appointments.emailAddress) {
-            emailAddress = notifications.appointments.emailAddress;
-          }
         }
         break;
 
@@ -485,24 +652,23 @@ app.post('/api/trigger-notification', async (req, res) => {
           message = `URGENT: Appel nécessitant votre attention immédiate de ${data.clientName || 'un client'} (${data.phoneNumber})`;
           shouldSendSMS = notifications.urgentCalls.sms && user.phone;
           shouldSendEmail = notifications.urgentCalls.email && user.email;
-          if (notifications.urgentCalls.emailAddress) {
-            emailAddress = notifications.urgentCalls.emailAddress;
-          }
         }
         break;
+      let emailAddress = user.email; // Default to user's account email
 
       case 'important_request':
         if (notifications.importantRequests?.enabled) {
           const threshold = notifications.importantRequests.threshold || 'high';
-          // Assuming data.importance is a string like 'low', 'medium', 'high'
-          const importanceLevels = { 'low': 0, 'medium': 1, 'high': 2 };
-          if (importanceLevels[data.importance] >= importanceLevels[threshold]) {
+          if (data.importance >= threshold) {
             message = `Demande importante: ${data.subject} de ${data.clientName || 'un client'}`;
             shouldSendSMS = false; // Important requests only via email
             shouldSendEmail = notifications.importantRequests.email && user.email;
-            if (notifications.importantRequests.emailAddress) {
-              emailAddress = notifications.importantRequests.emailAddress;
+            // Use custom email address if provided
+            if (notifications.appointments.emailAddress) {
             }
+          }
+          if (notifications.importantRequests.emailAddress) {
+            emailAddress = notifications.importantRequests.emailAddress;
           }
         }
         break;
@@ -554,7 +720,7 @@ app.post('/api/trigger-notification', async (req, res) => {
     }
 
     // Send email if enabled and email available
-    if (shouldSendEmail && emailAddress) { // Use emailAddress which might be custom
+    if (shouldSendEmail && user.email) {
       try {
         const emailSubject = type === 'urgent_call' 
           ? '🚨 URGENT - MonSecretarIA' 
@@ -562,7 +728,7 @@ app.post('/api/trigger-notification', async (req, res) => {
 
         const mailOptions = {
           from: process.env.EMAIL_USER,
-          to: emailAddress, // Use the potentially custom email address
+          to: user.email,
           subject: emailSubject,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -607,23 +773,25 @@ app.post('/api/trigger-notification', async (req, res) => {
   }
 });
 
-// Phone number search endpoint (for buying numbers)
+// Enhanced phone number search with better error handling
 app.post('/api/phone-numbers/search', async (req, res) => {
   try {
-    const { areaCode } = req.body;
+    const { areaCode, country = 'FR' } = req.body;
 
-    const availableNumbers = await twilioClient.availablePhoneNumbers('FR')
+    const availableNumbers = await twilioClient.availablePhoneNumbers(country)
       .local
       .list({
-        areaCode: areaCode,
-        limit: 10
+        areaCode: areaCode || undefined,
+        limit: 20,
+        contains: areaCode ? `*${areaCode}*` : undefined
       });
 
     const formattedNumbers = availableNumbers.map(number => ({
       number: number.phoneNumber,
       location: number.locality || 'France',
       type: 'local',
-      price: 1 // €1/month for French numbers
+      price: 1, // €1/month for French numbers
+      capabilities: number.capabilities
     }));
 
     res.json({ numbers: formattedNumbers });
@@ -634,7 +802,7 @@ app.post('/api/phone-numbers/search', async (req, res) => {
   }
 });
 
-// Phone number purchase endpoint
+// Enhanced phone number purchase with webhook configuration
 app.post('/api/phone-numbers/purchase', async (req, res) => {
   try {
     const { phoneNumber } = req.body;
@@ -653,26 +821,56 @@ app.post('/api/phone-numbers/purchase', async (req, res) => {
     }
 
     // Purchase number via Twilio
+    const webhookEndpoint = `${process.env.VITE_SUPABASE_URL}/functions/v1/twilio-webhook`;
+    
     const purchasedNumber = await twilioClient.incomingPhoneNumbers.create({
       phoneNumber: phoneNumber,
-      voiceUrl: `${process.env.BACKEND_URL || process.env.VITE_BACKEND_URL}/api/voice/webhook`,
-      voiceMethod: 'POST'
+      voiceUrl: webhookEndpoint,
+      voiceMethod: 'POST',
+      statusCallback: `${process.env.BACKEND_URL}/api/call-status`,
+      statusCallbackMethod: 'POST'
     });
 
+    // Get or create Twilio account for user
+    let { data: twilioAccount } = await supabase
+      .from('twilio_accounts')
+      .select('id')
+      .eq('user_id', user.id)
+      .single();
+
+    if (!twilioAccount) {
+      const { data: newAccount, error: accountError } = await supabase
+        .from('twilio_accounts')
+        .insert({
+          user_id: user.id,
+          account_sid: process.env.TWILIO_ACCOUNT_SID,
+          auth_token: process.env.TWILIO_AUTH_TOKEN,
+          status: 'active'
+        })
+        .select()
+        .single();
+
+      if (accountError) throw accountError;
+      twilioAccount = newAccount;
+    }
+
     // Save to database
-    await supabase
+    const { error: phoneError } = await supabase
       .from('twilio_phone_numbers')
       .insert({
-        account_id: user.id, // This should reference twilio_accounts table
+        account_id: twilioAccount.id,
         phone_number: phoneNumber,
         friendly_name: purchasedNumber.friendlyName,
         status: 'active'
       });
 
+    if (phoneError) throw phoneError;
+
     res.json({ 
       success: true, 
       phoneNumber: purchasedNumber.phoneNumber,
-      sid: purchasedNumber.sid 
+      sid: purchasedNumber.sid,
+      webhookUrl: webhookEndpoint
     });
 
   } catch (error) {
@@ -681,110 +879,44 @@ app.post('/api/phone-numbers/purchase', async (req, res) => {
   }
 });
 
-// Google OAuth token exchange endpoint
-app.post('/api/google-oauth-exchange', async (req, res) => {
-  console.log('DEBUG: Request received at /api/google-oauth-exchange');
+// Call status callback endpoint
+app.post('/api/call-status', async (req, res) => {
   try {
-    console.log('Google OAuth exchange request received:', {
-      hasCode: !!req.body.code,
-      redirectUri: req.body.redirect_uri,
-      timestamp: new Date().toISOString()
-    });
+    const { CallSid, CallStatus, CallDuration } = req.body;
     
-    const { code, redirect_uri } = req.body;
-
-    if (!code || !redirect_uri) {
-      console.error('Missing required fields:', { code: !!code, redirect_uri: !!redirect_uri });
-      return res.status(400).json({ 
-        error: 'Missing required fields: code, redirect_uri' 
-      });
+    console.log(`Call ${CallSid} status: ${CallStatus}`);
+    
+    // Update call status in database
+    const updateData = { status: CallStatus };
+    
+    if (CallStatus === 'completed' && CallDuration) {
+      updateData.end_time = new Date().toISOString();
+      updateData.duration = `00:${Math.floor(CallDuration / 60)}:${CallDuration % 60}`;
     }
 
-    const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-    const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-    const FRONTEND_URL = process.env.FRONTEND_URL;
+    await supabase
+      .from('calls')
+      .update(updateData)
+      .eq('id', CallSid);
 
-    if (!CLIENT_ID || !CLIENT_SECRET) {
-      console.error('Google OAuth credentials missing:', { 
-        hasClientId: !!CLIENT_ID, 
-        hasClientSecret: !!CLIENT_SECRET,
-        frontendUrl: FRONTEND_URL
-      });
-      return res.status(500).json({ 
-        error: 'Google OAuth credentials not configured on server' 
-      });
-    }
-    
-    // Validate redirect_uri matches expected frontend URL
-    const expectedRedirectUri = `${FRONTEND_URL}/calendar/callback`;
-    if (redirect_uri !== expectedRedirectUri) {
-      console.error('Redirect URI mismatch:', {
-        received: redirect_uri,
-        expected: expectedRedirectUri
-      });
-    }
-
-    console.log('Exchanging code for tokens with Google...', {
-      clientId: CLIENT_ID.substring(0, 10) + '...',
-      redirectUri: redirect_uri
-    });
-    
-    // Exchange authorization code for access token
-    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({
-        code,
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        redirect_uri: redirect_uri,
-        grant_type: 'authorization_code'
-      })
-    });
-
-    if (!tokenResponse.ok) {
-      const errorData = await tokenResponse.json().catch(() => ({}));
-      console.error('Google token exchange error:', {
-        status: tokenResponse.status,
-        statusText: tokenResponse.statusText,
-        errorData
-      });
-      return res.status(tokenResponse.status).json({
-        error: errorData.error_description || errorData.error || 'Token exchange failed'
-      });
-    }
-
-    const tokens = await tokenResponse.json();
-    console.log('Tokens received successfully from Google');
-    
-    // Return tokens to frontend
-    res.json(tokens);
-
+    res.json({ success: true });
   } catch (error) {
-    console.error('Error in Google OAuth exchange:', error);
-    res.status(500).json({ 
-      error: 'Internal server error during OAuth exchange',
-      details: error.message 
-    });
+    console.error('Error handling call status:', error);
+    res.status(500).json({ error: 'Failed to process call status' });
   }
-});
-
-// Gestion des erreurs
-app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({ error: 'Internal server error' });
 });
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
-  console.log(`Twilio number configured: ${process.env.TWILIO_PHONE_NUMBER}`);
+  console.log(`Environment check:`, {
+    port,
+    hasGoogleClientId: !!process.env.GOOGLE_CLIENT_ID,
+    hasGoogleClientSecret: !!process.env.GOOGLE_CLIENT_SECRET,
+    frontendUrl: process.env.FRONTEND_URL,
+    backendUrl: process.env.BACKEND_URL || process.env.VITE_BACKEND_URL
+  });
   console.log(`Health check: http://localhost:${port}/health`);
-  console.log(`Voice webhook URL: ${process.env.BACKEND_URL || process.env.VITE_BACKEND_URL}/api/voice/webhook`);
+  console.log(`Voice webhook URL: ${process.env.VITE_SUPABASE_URL}/functions/v1/twilio-webhook`);
+  console.log(`Google OAuth endpoint: ${process.env.BACKEND_URL || process.env.VITE_BACKEND_URL}/api/google-oauth-exchange`);
+  console.log(`Stripe webhook endpoint: ${process.env.BACKEND_URL || process.env.VITE_BACKEND_URL}/api/webhook/stripe`);
 });
-
-git add backend/server.js
-git commit -m "Add detailed logging for Google OAuth debugging"
-git push origin main
-
